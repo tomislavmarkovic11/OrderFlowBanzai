@@ -25,7 +25,7 @@ Event-driven microservices system built with Spring Boot 3.5, Apache Kafka (KRaf
 |  |    Kafka     |  Topic: orders.created  (3 partitions)            |
 |  |  Broker      |  Topic: inventory.reserved                        |
 |  |  :9092       |  Topic: inventory.rejected                        |
-|  |              |  Topic: orders.created.DLQ                        |
+|  |              |  Topic: orders.created.DLT                        |
 |  +------+-------+                                                    |
 |         |                                                            |
 |         |  Consume: orders.created                                   |
@@ -82,7 +82,7 @@ Event-driven microservices system built with Spring Boot 3.5, Apache Kafka (KRaf
 **Prerequisites**: Docker Desktop (or Docker Engine + Compose v2)
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/tomislavmarkovic11/OrderFlowBanzai.git
 cd OrderFlowBanzai
 docker compose up --build
 ```
@@ -143,7 +143,7 @@ X-Trace-Id: my-trace-123   (optional — generated if absent)
 | Status | When | Body |
 |---|---|---|
 | `202 Accepted` | Event confirmed by Kafka broker | `{"traceId":"…","status":"ACCEPTED","message":"Order received"}` |
-| `400 Bad Request` | Validation failure | `{"error":"VALIDATION_ERROR","details":[…]}` |
+| `400 Bad Request` | Validation failure | `{"error":"VALIDATION_ERROR","details":[{"field":"…","message":"…"}],"timestamp":"…"}` |
 | `503 Service Unavailable` | Kafka down or publish timeout > 5 s | `{"error":"BROKER_UNAVAILABLE","message":"…"}` |
 | `500 Internal Server Error` | Unexpected error | `{"error":"INTERNAL_ERROR","message":"…"}` |
 
@@ -201,7 +201,7 @@ X-Trace-Id: my-trace-123   (optional — generated if absent)
 | `orders.created` | 3 | 7 days | `OrderCreated` events from the API |
 | `inventory.reserved` | 1 | 7 days | Successful stock reservations |
 | `inventory.rejected` | 1 | 7 days | Failed reservations (insufficient stock) |
-| `orders.created.DLQ` | 1 | 30 days | Poison / unprocessable messages |
+| `orders.created-dlt` | 1 | 30 days | Poison / unprocessable messages (Spring DLT suffix) |
 
 Message key = `orderId` → same order always routes to the same partition → ordering per order guaranteed.
 
@@ -322,7 +322,7 @@ Lock-free and correct under any concurrency level. Exactly one thread wins for t
 | 1st retry | 1 s |
 | 2nd retry | 2 s |
 | 3rd retry | 4 s |
-| Exhausted | → `orders.created.DLQ` |
+| Exhausted | → `orders.created-dlt` |
 
 `JsonParseException` (malformed JSON) is non-retryable — goes straight to DLQ without wasting retry budget.
 
@@ -354,8 +354,8 @@ Both services emit JSON via `logstash-logback-encoder`. Every log line includes:
 
 | Endpoint | Service | What It Shows |
 |---|---|---|
-| `GET /actuator/health` | Both | App status, Kafka connectivity |
-| `GET /actuator/metrics` | Both | JVM, HTTP request counts, Kafka consumer lag |
+| `GET /actuator/health` | Both | App status — `diskSpace`, `ping`, `ssl` components |
+| `GET /actuator/metrics` | Both | JVM, HTTP, Kafka template/listener metrics |
 | `GET /actuator/metrics/inventory.reservations.success` | Inventory | Custom counter — successful reservations |
 | `GET /actuator/metrics/inventory.reservations.rejected` | Inventory | Custom counter — rejected reservations |
 
@@ -385,21 +385,21 @@ curl -s http://localhost:8081/actuator/health | jq .
 {
   "status": "UP",
   "components": {
-    "kafka": { "status": "UP" },
     "diskSpace": { "status": "UP" },
-    "ping": { "status": "UP" }
+    "ping":      { "status": "UP" },
+    "ssl":       { "status": "UP" }
   }
 }
 ```
 
 ### Kafka Connectivity
 
-```bash
-# Kafka health component — order-service
-curl -s http://localhost:8080/actuator/health/kafka | jq .
+There is no dedicated Kafka health component — use the `spring.kafka.template` and `spring.kafka.listener` metrics to verify Kafka is being used successfully (see Metrics section below).
 
-# Kafka health component — inventory-service
-curl -s http://localhost:8081/actuator/health/kafka | jq .
+```bash
+# All health components — both services return: diskSpace, ping, ssl
+curl -s http://localhost:8080/actuator/health | jq '.components | keys'
+curl -s http://localhost:8081/actuator/health | jq '.components | keys'
 ```
 
 ### Metrics
@@ -415,22 +415,26 @@ curl -s http://localhost:8081/actuator/metrics | jq '.names[]'
 curl -s http://localhost:8080/actuator/metrics/jvm.memory.used | jq .
 curl -s http://localhost:8081/actuator/metrics/jvm.memory.used | jq .
 
-# HTTP request count — order-service
-curl -s "http://localhost:8080/actuator/metrics/http.server.requests" | jq .
+# HTTP request count and latency — order-service
+curl -s http://localhost:8080/actuator/metrics/http.server.requests | jq .
+
+# Kafka producer template metrics — order-service (publish count, latency)
+curl -s http://localhost:8080/actuator/metrics/spring.kafka.template | jq .
+
+# Kafka listener metrics — inventory-service (consume count, success/failure)
+curl -s http://localhost:8081/actuator/metrics/spring.kafka.listener | jq .
 
 # Successful inventory reservations (custom Micrometer counter)
 curl -s http://localhost:8081/actuator/metrics/inventory.reservations.success | jq .
 
 # Rejected inventory reservations (custom Micrometer counter)
 curl -s http://localhost:8081/actuator/metrics/inventory.reservations.rejected | jq .
-
-# Kafka consumer lag — inventory-service
-curl -s "http://localhost:8081/actuator/metrics/kafka.consumer.fetch.manager.records.lag" | jq .
 ```
 
 ### Application Info
 
 ```bash
+# Returns {} — no build info configured (acceptable for demo scope)
 curl -s http://localhost:8080/actuator/info | jq .
 curl -s http://localhost:8081/actuator/info | jq .
 ```
@@ -439,11 +443,13 @@ curl -s http://localhost:8081/actuator/info | jq .
 
 ```bash
 # List all available actuator links — order-service
-curl -s http://localhost:8080/actuator | jq '.\_links | keys'
+curl -s http://localhost:8080/actuator | jq '."_links" | keys'
 
 # List all available actuator links — inventory-service
-curl -s http://localhost:8081/actuator | jq '.\_links | keys'
+curl -s http://localhost:8081/actuator | jq '."_links" | keys'
 ```
+
+Both services expose: `health`, `info`, `metrics`, `prometheus`.
 
 ### Quick System Status (one-liner)
 
@@ -502,15 +508,30 @@ curl -X POST http://localhost:8080/orders \
 docker compose start kafka
 ```
 
-### Poison Message (DLQ)
+### Poison Message (DLT — Dead Letter Topic)
 
 ```bash
-# Publish malformed JSON directly to the topic (requires kcat installed)
-echo "not-valid-json" | kcat -b localhost:9092 -P -t orders.created
+# Send invalid JSON directly to the topic — no extra tools needed
+echo "THIS IS NOT VALID JSON" | docker exec -i kafka \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic orders.created
 
-# Consumer logs the error and routes to orders.created.DLQ
-# Consumer continues processing subsequent messages
-docker compose logs inventory-service | grep -i "dlq\|deserialization"
+# After ~1 s the error appears in logs (JsonParseException → retry → DLT)
+docker compose logs inventory-service | grep "Failed to deserialize\|Retry attempt\|dlt"
+
+# Read all messages sitting on the dead letter topic (exits after reading all existing messages)
+docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic orders.created-dlt \
+  --from-beginning \
+  --max-messages 10 \
+  --property print.timestamp=true \
+  --property print.headers=true
+
+# List all topics (confirms orders.created-dlt exists)
+docker exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list
 ```
 
 ---
