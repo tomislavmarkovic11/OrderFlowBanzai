@@ -1,0 +1,30 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: orderflowbanzai-inventory-service
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: inventory-service-group
+
+app:
+  kafka:
+    topics:
+      orders-created: orders.created
+      inventory-reserved: inventory.reserved
+      inventory-rejected: inventory.rejected
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  config: classpath:logback-spring.xml
+
